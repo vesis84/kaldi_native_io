@@ -11,6 +11,7 @@
 #define KALDI_NATIVE_IO_CSRC_WAVE_READER_H_
 
 #include <istream>
+#include <list>
 #include <string>
 #include <utility>
 #include <vector>
@@ -131,13 +132,18 @@ class WaveData {
   }
 
  private:
-  /// Internal impl. of Read, reads data blockwise and merges blocks at the end.
-  static std::vector<char> ReadData(std::istream &is, const WaveInfo& header);
+  /// Internal impl. of Read, reads data into list of buffers.
+  static void ReadData(std::istream &is,
+                       const WaveInfo& header,
+                       std::list<std::vector<char>>* buffers);
+
+  /// Internal impl. of Read, fills list of buffers into matrix.
+  static void FillMatrix(std::list<std::vector<char>>& buffers,
+                         const WaveInfo& header,
+                         Matrix<float>* data);
 
  private:
-  //static const uint32_t kBlockSize = 1024 * 1024;  // Use 1M bytes.
-  //static const uint32_t kBlockSize = 100 * 1024 * 1024;  // Use 100M bytes.
-  static const uint32_t kBlockSize = 10 * 1024 * 1024;  // Use 10M bytes.
+  static const uint32_t kBlockSize = 1024 * 1024;  // Use 1M bytes.
   Matrix<float> data_;
   float samp_freq_;
 };

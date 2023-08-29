@@ -276,103 +276,101 @@ void WaveData::Read(std::istream &is) {
   data_.Resize(0, 0);  // clear the data.
   samp_freq_ = header.SampFreq();
 
-  const std::vector<char>& buffer = WaveData::ReadData(is, header);
-  // (the tmp object exists till end of the scope of the reference, optimization)
-
-  if (is.bad()) KALDIIO_ERR << "WaveData: file read error";
-
-  if (buffer.size() == 0) KALDIIO_ERR << "WaveData: empty file (no data)";
-
-  if (!header.IsStreamed() && buffer.size() < header.DataBytes()) {
-    KALDIIO_WARN << "Expected " << header.DataBytes() << " bytes of wave data, "
-                 << "but read only " << buffer.size() << " bytes. "
-                 << "Truncated file?";
-  }
-
-  const int16 *data_ptr = reinterpret_cast<const int16 *>(&buffer[0]);
-
-  // The matrix is arranged row per channel, column per sample.
-  data_.Resize(header.NumChannels(), buffer.size() / header.BlockAlign());
-  for (int32 i = 0; i < data_.NumCols(); ++i) {
-    for (int32 j = 0; j < data_.NumRows(); ++j) {
-      int16 k = *data_ptr++;
-      if (header.ReverseBytes()) KALDIIO_SWAP2(k);
-      data_(j, i) = k;
-    }
-  }
-}
-
-
-std::vector<char> WaveData::ReadData(std::istream &is, const WaveInfo& header) {
-
   // We use list of buffers, to avoid re-allocations and memory moves when
   // loading large files. The output vector is assembled later.
   std::list<std::vector<char>> buffers;
+  WaveData::ReadData(is, header, &buffers);
 
+  if (is.bad()) KALDIIO_ERR << "WaveData: file read error";
+
+  int64_t total_bytes = 0;
+  for (const auto& buffer : buffers) {
+    total_bytes += buffer.size();
+  }
+  if (total_bytes == 0) KALDIIO_ERR << "WaveData: empty file (no data)";
+
+  if (!header.IsStreamed() && total_bytes < header.DataBytes()) {
+    KALDIIO_WARN << "Expected " << header.DataBytes() << " bytes of wave data, "
+                 << "but read only " << total_bytes << " bytes. "
+                 << "Truncated file?";
+  }
+
+  // The matrix is arranged row per channel, column per sample.
+  data_.Resize(header.NumChannels(), total_bytes / header.BlockAlign());
+
+  // Fill the audio samples.
+  WaveData::FillMatrix(buffers, header, &data_);
+}
+
+
+void WaveData::ReadData(std::istream &is,
+                        const WaveInfo& header,
+                        std::list<std::vector<char>>* buffers)
+{
+  // initial block_size (grows by powers of 2)
   int64_t block_size = static_cast<int64_t>(kBlockSize);
 
   // read wav data to buffers
-  {
-    int64_t bytes_to_go = header.IsStreamed() ? kBlockSize : header.DataBytes();
+  int64_t bytes_to_go = header.IsStreamed() ? kBlockSize : header.DataBytes();
 
-    // Once in a while header.DataBytes() will report an insane value;
-    // read the file to the end
-    while (is && bytes_to_go > 0) {
-      // not more than kBlockSize bytes per buffer
-      uint32 block_bytes = std::min(bytes_to_go, block_size);
-      buffers.emplace_back(block_bytes); // add vector to back()
-      is.read(buffers.back().data(), block_bytes);
+  // Once in a while header.DataBytes() will report an insane value;
+  // read the file to the end
+  while (is && bytes_to_go > 0) {
+    // not more than kBlockSize bytes per buffer
+    uint32 block_bytes = std::min(bytes_to_go, block_size);
+    buffers->emplace_back(block_bytes); // add vector to back()
+    is.read(buffers->back().data(), block_bytes);
 
-      std::streamsize bytes_last_read = is.gcount(); // signed type
-      buffers.back().resize(bytes_last_read);
+    std::streamsize bytes_last_read = is.gcount(); // signed type
+    buffers->back().resize(bytes_last_read);
 
-      if (! header.IsStreamed()) bytes_to_go -= bytes_last_read;
+    if (! header.IsStreamed()) bytes_to_go -= bytes_last_read;
 
-      if (is.eof()) break;
-      if (is.fail()) {
-        KALDIIO_ERR << "WaveData: file read error (stream read failed).";
-      }
-
-      block_size *= 2;
+    if (is.eof()) break;
+    if (is.fail()) {
+      KALDIIO_ERR << "WaveData: file read error (stream read failed).";
     }
+
+    block_size *= 2;
   }
+}
 
-  // prepare the output buffer
-  {
-    std::vector<char> buffer_out;
+void WaveData::FillMatrix(std::list<std::vector<char>>& buffers,
+                          const WaveInfo& header,
+                          Matrix<float>* matrix)
+{
+  // select 1st buffer,
+  std::vector<char>* buffer = &buffers.front();
+  KALDIIO_ASSERT(buffer->size() % 2 == 0); // size of each buffer must be even...
+  const int16 * data_ptr = reinterpret_cast<const int16 *>(buffer->data());
 
-    if (buffers.size() == 0) {
-      KALDIIO_ERR << "WaveData: file read error (no buffer)";
-    }
+  for (int32 i = 0; i < matrix->NumCols(); ++i) {
+    for (int32 j = 0; j < matrix->NumRows(); ++j) {
 
-    // shortcut for small files
-    if (buffers.size() == 1) {
-      buffer_out.swap(buffers.front());
-      return buffer_out;
-    }
+      // how much was read,
+      int32 bytes_read_from_buffer = reinterpret_cast<const char *>(data_ptr) - buffer->data();
+      KALDIIO_ASSERT(bytes_read_from_buffer <= buffer->size());
 
-    { // assemble the vectors to single vector
-      int32 total_size = 0;
-      for (auto& b : buffers) {
-        total_size += b.size();
+      // switch to next buffer ?
+      if (bytes_read_from_buffer == buffer->size()) {
+        buffers.pop_front(); // remove buffer
+        if (buffers.size() > 0) {
+          buffer = &buffers.front(); // select next buffer
+          data_ptr = reinterpret_cast<const int16 *>(buffer->data());
+        } else {
+          data_ptr = nullptr;
+        }
       }
+      KALDIIO_ASSERT(data_ptr != nullptr);
 
-      // pre-allocate
-      //buffer_out.reserve(total_size);
-      buffer_out.resize(total_size);
-      // concatenate buffers
-      char* ptr_write = buffer_out.data();
-      for (auto& b : buffers) {
-        memcpy(ptr_write, b.data(), b.size());
-        ptr_write += b.size();
-        // buffer_out.insert(buffer_out.end(), b.begin(), b.end());
-      }
-      KALDIIO_ASSERT(ptr_write - buffer_out.data() == total_size);
-
-      return buffer_out;
+      // copy the audio sample,
+      int16 k = *data_ptr++;
+      if (header.ReverseBytes()) KALDIIO_SWAP2(k);
+      (*matrix)(j, i) = k;
     }
   }
 }
+
 
 
 // Write 16-bit PCM.
